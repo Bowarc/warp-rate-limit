@@ -163,28 +163,48 @@ impl warp::reject::Reject for RateLimitRejection {}
 
 #[derive(Clone)]
 struct RateLimiter {
-    state: Arc<RwLock<HashMap<String, (Instant, u32)>>>,
+    state: Arc<RwLock<RateLimiterMap>>,
     config: RateLimitConfig,
+}
+
+// I really didn't want to have two different Arc<RwLock<T>> for data so interlinked
+#[derive(Clone)]
+struct RateLimiterMap {
+    inner: HashMap<String, (Instant, u32)>,
+    last_cleanup: Instant,
 }
 
 impl RateLimiter {
     fn new(config: RateLimitConfig) -> Self {
         Self {
-            state: Arc::new(RwLock::new(HashMap::new())),
+            state: Arc::new(RwLock::new(RateLimiterMap {
+                last_cleanup: Instant::now(),
+                inner: HashMap::default(),
+            })),
             config,
         }
     }
 
     async fn check_rate_limit(&self, key: &str) -> Result<RateLimitInfo, Rejection> {
-        let mut state = self.state.write().await;
+        let mut map = self.state.write().await;
         let now = Instant::now();
-        let current = state.get(key).copied();
+
+        println!("Map: {:#?}", map.inner);
+
+        // Cleanup the map to remove old entries
+        if now - map.last_cleanup > self.config.window {
+            map.inner
+                .retain(|_ip, (last_request, _count)| now - *last_request < self.config.window);
+            map.last_cleanup = now;
+        }
+
+        let current = map.inner.get(key).copied();
 
         match current {
             Some((last_request, count)) => {
                 if now.duration_since(last_request) > self.config.window {
                     // Window has passed, reset counter
-                    state.insert(key.to_owned(), (now, 1));
+                    map.inner.insert(key.to_owned(), (now, 1));
                     Ok(self.create_info(self.config.max_requests - 1, now))
                 } else if count >= self.config.max_requests {
                     // Rate limit exceeded
@@ -199,13 +219,13 @@ impl RateLimiter {
                     }))
                 } else {
                     // Increment counter
-                    state.insert(key.to_owned(), (last_request, count + 1));
+                    map.inner.insert(key.to_owned(), (last_request, count + 1));
                     Ok(self.create_info(self.config.max_requests - (count + 1), last_request))
                 }
             }
             None => {
                 // First request
-                state.insert(key.to_owned(), (now, 1));
+                map.inner.insert(key.to_owned(), (now, 1));
                 Ok(self.create_info(self.config.max_requests - 1, now))
             }
         }

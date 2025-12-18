@@ -21,7 +21,7 @@ pub struct RateLimitConfig {
     /// Format for Retry-After header (RFC 7231 Date or Seconds)
     pub retry_after_format: RetryAfterFormat,
 
-    // Header used to extract the client's ip address
+    /// Header used to extract the client's ip address
     pub ip_header: String,
 }
 /// Sensible (opinionated) defaults
@@ -32,7 +32,7 @@ impl Default for RateLimitConfig {
             window: Duration::from_secs(60),
             retry_after_format: RetryAfterFormat::HttpDate,
 
-            ip_header: String::from("X-Forwarded-For"), // It's the one used for most of there revese proxies
+            ip_header: String::from("X-Forwarded-For"), // It's the one used by most of the revese proxies
         }
     }
 }

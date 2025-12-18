@@ -87,7 +87,6 @@ async fn handle_rejection(rejection: Rejection) -> Result<impl Reply, Infallible
 
         Ok(json_response)
     } else {
-        println!("{rejection:?}");
         // Handle other rejections with JSON
         Ok(warp::reply::with_status(
             warp::reply::json(&MyCustomError {

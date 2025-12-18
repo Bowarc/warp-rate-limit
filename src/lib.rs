@@ -189,8 +189,6 @@ impl RateLimiter {
         let mut map = self.state.write().await;
         let now = Instant::now();
 
-        println!("Map: {:#?}", map.inner);
-
         // Cleanup the map to remove old entries
         if now - map.last_cleanup > self.config.window {
             map.inner

@@ -56,11 +56,11 @@ async fn handle_request(rate_limit_info: RateLimitInfo) -> Result<impl Reply, Re
 async fn handle_rejection(rejection: Rejection) -> Result<impl Reply, Infallible> {
     // let's handle rate limit rejections specifically:
     if let Some(rate_limit_rejection) = rejection.find::<RateLimitRejection>() {
-        // We have a rate limit rejection -- so let's get some info about it:
-        let info = get_rate_limit_info(rate_limit_rejection);
-
         // Let's use that info to create a response:
-        let message = format!("Rate limit exceeded. Try again after {}.", info.retry_after);
+        let message = format!(
+            "Rate limit exceeded. Try again after {:?}.",
+            rate_limit_rejection.retry_after
+        );
 
         // Let's build that response:
         let mut response =
@@ -78,7 +78,9 @@ async fn handle_rejection(rejection: Rejection) -> Result<impl Reply, Infallible
         // }
 
         // If you want full control over error handling, you can do something like this:
-        if let Err(e) = add_rate_limit_headers(response.headers_mut(), &info) {
+        if let Err(e) =
+            add_rate_limit_headers_from_rejection(response.headers_mut(), rate_limit_rejection)
+        {
             match e {
                 RateLimitError::HeaderError(e) => {
                     eprintln!(

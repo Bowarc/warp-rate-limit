@@ -67,7 +67,6 @@ async fn handle_request(rate_limit_info: RateLimitInfo) -> Result<impl Reply, Re
 async fn handle_rejection(rejection: Rejection) -> Result<impl Reply, Infallible> {
     if let Some(rate_limit_rejection) = rejection.find::<RateLimitRejection>() {
         // Grab the rate limit info:
-        let info = get_rate_limit_info(rate_limit_rejection);
 
         // Create a json response based on that info:
         let mut json_response = warp::reply::with_status(
@@ -83,7 +82,10 @@ async fn handle_rejection(rejection: Rejection) -> Result<impl Reply, Infallible
         .into_response(); // Convert it into a Response
 
         // Add the rate limit headers:
-        let _ = add_rate_limit_headers(json_response.headers_mut(), &info);
+        let _ = add_rate_limit_headers_from_rejection(
+            json_response.headers_mut(),
+            rate_limit_rejection,
+        );
 
         Ok(json_response)
     } else {

@@ -1,3 +1,4 @@
+use chrono::TimeDelta;
 use serde::Serialize;
 use serde_json::json;
 use std::convert::Infallible;
@@ -22,7 +23,7 @@ async fn main() {
     // Configure rate limiting: 3 requests per 30 seconds
     let rate_limit = RateLimitConfig {
         max_requests: 3,
-        window: std::time::Duration::from_secs(30),
+        window: TimeDelta::seconds(30),
         retry_after_format: RetryAfterFormat::Seconds,
         ..Default::default()
     };

@@ -1,11 +1,15 @@
-use chrono::Utc;
-use warp_rate_limit::*;
-use std::{convert::Infallible, time::Duration};
+use chrono::{TimeDelta, Utc};
+use std::{
+    convert::Infallible,
+};
 use tokio::task::JoinSet;
-use warp::{reject::Rejection, Reply};
-use warp::{http::StatusCode, test::request, Filter};
 use warp::hyper::header;
-
+use warp::{http::StatusCode, test::request, Filter};
+use warp::{reject::Rejection, Reply};
+use warp_rate_limit::{
+    add_rate_limit_headers, add_rate_limit_headers_from_rejection, with_rate_limit,
+    RateLimitConfig, RateLimitError, RateLimitInfo, RateLimitRejection, RetryAfterFormat,
+};
 
 // Helper function to create a test rate limiter with rejection handling
 async fn create_test_route(
@@ -14,12 +18,12 @@ async fn create_test_route(
     with_rate_limit(config)
         .map(|info: RateLimitInfo| info.remaining.to_string())
         .recover(|rejection: Rejection| async move {
-            if let Some(rate_limit) = rejection.find::<RateLimitRejection>() {
-                let info = get_rate_limit_info(rate_limit);
+            if let Some(rate_limit_rejection) = rejection.find::<RateLimitRejection>() {
                 let mut resp =
                     warp::reply::with_status("Rate limit exceeded", StatusCode::TOO_MANY_REQUESTS)
                         .into_response();
-                add_rate_limit_headers(resp.headers_mut(), &info).unwrap();
+                add_rate_limit_headers_from_rejection(resp.headers_mut(), rate_limit_rejection)
+                    .unwrap();
                 Ok(resp)
             } else {
                 Ok(
@@ -34,19 +38,19 @@ async fn create_test_route(
 fn test_config_builders() {
     // Test max_per_minute builder
     let per_minute = RateLimitConfig::max_per_minute(60);
-    assert_eq!(per_minute.window, Duration::from_secs(60));
+    assert_eq!(per_minute.window, TimeDelta::seconds(60));
     assert_eq!(per_minute.max_requests, 60);
     assert_eq!(per_minute.retry_after_format, RetryAfterFormat::HttpDate);
 
     // Test max_per_window builder
     let custom = RateLimitConfig::max_per_window(30, 120);
-    assert_eq!(custom.window, Duration::from_secs(120));
+    assert_eq!(custom.window, TimeDelta::seconds(120));
     assert_eq!(custom.max_requests, 30);
     assert_eq!(custom.retry_after_format, RetryAfterFormat::HttpDate);
 
     // Test default config
     let default = RateLimitConfig::default();
-    assert_eq!(default.window, Duration::from_secs(60));
+    assert_eq!(default.window, TimeDelta::seconds(60));
     assert_eq!(default.max_requests, 60);
     assert_eq!(default.retry_after_format, RetryAfterFormat::HttpDate);
 }
@@ -55,7 +59,7 @@ fn test_config_builders() {
 async fn test_comprehensive_rate_limit_rejection() {
     let config = RateLimitConfig {
         max_requests: 1,
-        window: Duration::from_secs(5),
+        window: TimeDelta::seconds(5),
         retry_after_format: RetryAfterFormat::Seconds,
         ..Default::default()
     };
@@ -99,7 +103,7 @@ async fn test_retry_after_formats() {
     // Test HttpDate format
     let http_date_config = RateLimitConfig {
         max_requests: 1,
-        window: Duration::from_secs(15),
+        window: TimeDelta::seconds(15),
         retry_after_format: RetryAfterFormat::HttpDate,
         ..Default::default()
     };
@@ -129,7 +133,7 @@ async fn test_retry_after_formats() {
     // Test Seconds format
     let seconds_config = RateLimitConfig {
         max_requests: 1,
-        window: Duration::from_secs(5),
+        window: TimeDelta::seconds(5),
         retry_after_format: RetryAfterFormat::Seconds,
         ..Default::default()
     };
@@ -158,40 +162,11 @@ async fn test_retry_after_formats() {
     assert!(retry_after_sec.parse::<u64>().unwrap() <= 5);
 }
 
-#[test]
-fn test_rate_limit_info_extraction() {
-    let now = Utc::now();
-    let rejection = RateLimitRejection {
-        retry_after: Duration::from_secs(60),
-        limit: 100,
-        reset_time: now,
-        retry_after_format: RetryAfterFormat::Seconds,
-    };
-
-    let info = get_rate_limit_info(&rejection);
-
-    assert_eq!(info.limit, 100);
-    assert_eq!(info.remaining, 0);
-    assert_eq!(info.reset_timestamp, now.timestamp());
-    assert_eq!(info.retry_after, "60");
-
-    // Test with HttpDate format
-    let rejection_http = RateLimitRejection {
-        retry_after: Duration::from_secs(60),
-        limit: 100,
-        reset_time: now,
-        retry_after_format: RetryAfterFormat::HttpDate,
-    };
-
-    let info_http = get_rate_limit_info(&rejection_http);
-    assert!(!info_http.retry_after.is_empty()); // RFC2822 date format
-}
-
 #[tokio::test]
 async fn test_concurrent_requests() {
     let config = RateLimitConfig {
         max_requests: 5,
-        window: Duration::from_secs(1),
+        window: TimeDelta::seconds(1),
         retry_after_format: RetryAfterFormat::Seconds,
         ..Default::default()
     };
@@ -231,14 +206,29 @@ async fn test_concurrent_requests() {
 #[test]
 fn test_invalid_header_value_handling() {
     let mut headers = header::HeaderMap::new();
+
     let invalid_info = RateLimitInfo {
         retry_after: "invalid\u{0000}characters".to_string(),
         limit: 100,
         remaining: 50,
         reset_timestamp: 1234567890,
         retry_after_format: RetryAfterFormat::Seconds,
+        internal_map_len: 0,
+        last_cleanup_time: Utc::now(),
     };
 
     let result = add_rate_limit_headers(&mut headers, &invalid_info);
     assert!(matches!(result, Err(RateLimitError::HeaderError(_))));
+
+    // let mut headers = header::HeaderMap::new();
+
+    // let invalid_info = RateLimitRejection {
+    //     retry_after: Duration::from_secs(10),
+    //     limit: 100,
+    //     reset_time: DateTime::UNIX_EPOCH,
+    //     retry_after_format: RetryAfterFormat::Seconds,
+    // };
+
+    // let result = add_rate_limit_headers_from_rejection(&mut headers, &invalid_info);
+    // assert!(matches!(result, Err(RateLimitError::HeaderError(_))));
 }

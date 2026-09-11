@@ -1,119 +1,8 @@
 #![forbid(unsafe_code)]
-//! This crate provides RFC 6585 compliant in-memory rate limiting with
-//! configurable windows and limits as lightweight middleware for
-//! Warp web applications.
-//!
-//! It provides a Filter you add to your routes that exposes rate-limiting
-//! information to your handlers, and a Rejection Type for error recovery.
-//!
-//! It does not yet provide persistence, nor is the HashMap that stores IPs
-//! bounded. Both of these may be changed in a future version.
-//!
-//! # Quickstart
-//!
-//! 1. Include the crate:
-//!
-//! `cargo add warp-rate-limit`
-//!
-//! 2. Define one or more rate limit configurations. Following are some
-//! examples of available builder methods. The variable names are arbitrary:
-//!
-//! ```rust,no_run,ignore
-//! // Limit: 60 requests per 60 Earth seconds
-//! let public_routes_rate_limit = RateLimitConfig::default();
-//!
-//! // Limit: 100 requests per 60 Earth seconds
-//! let parter_routes_rate_limit = RateLimitConfig::max_per_minute(100);
-//!
-//! // Limit: 10 requests per 20 Earth seconds
-//! let static_route_limit = RateLimitConfig::max_per_window(10,20);
-//! ```
-//!
-//! 3. Use rate limiting information in request handler. If you don't want
-//! to use rate-limiting information related to the IP address associated
-//! with this request, you can skip this part.
-//!
-//! ```rust,no_run,ignore
-//! // Example route handler
-//! async fn hande_request(rate_limit_info: RateLimitInfo) -> Result<impl Reply, Rejection> {
-//!     // Create a base response
-//!     let mut response = warp::reply::with_status(
-//!         "Hello world",
-//!         StatusCode::OK
-//!     ).into_response();
-//!
-//!     // Optionally add rate limit headers to your response.
-//!     if let Err(e) = add_rate_limit_headers(response.headers_mut(), &rate_limit_info) {
-//!         match e {
-//!             RateLimitError::HeaderError(e) => {
-//!                 eprintln!("Failed to set rate limit headers due to invalid value: {}", e);
-//!             }
-//!             RateLimitError::Other(e) => {
-//!                 eprintln!("Unexpected error setting rate limit headers: {}", e);
-//!             }
-//!         }
-//!     }
-//!
-//!     // You could also replace the above `if let Err(e)` block with:
-//!     // let _ = add_rate_limit_headers(response.headers_mut(), &rate_limit_info);
-//!
-//!     Ok(response)
-//! }
-//! ```
-//!
-//! 4. Handle rate limit errors in your rejection handler:
-//!
-//! ```rust,no_run,ignore
-//! // Example rejection handler
-//! async fn handle_rejection(rejection: Rejection) -> Result<impl Reply, Infallible> {
-//!     // Somewhere in your rejection handling:
-//!     if let Some(rate_limit_rejection) = rejection.find::<RateLimitRejection>() {
-//!         // We have a rate limit rejection -- so let's get some info about it:
-//!         let info = get_rate_limit_info(rate_limit_rejection);
-//!
-//!         // Let's use that info to create a response:
-//!         let message = format!(
-//!             "Rate limit exceeded. Try again after {}.",
-//!             info.retry_after
-//!         );
-//!
-//!         // Let's build that response:
-//!         let mut response = warp::reply::with_status(
-//!             message,
-//!             StatusCode::TOO_MANY_REQUESTS
-//!         ).into_response();
-//!
-//!         // Then, let's add the rate-limiting headers to that response:
-//!         if let Err(e) = add_rate_limit_headers(response.headers_mut(), &info) {
-//!             // Whether or not you use the specific RateLimitError in
-//!             // your handler, consider handling errors explicitly here.
-//!             // Again, though, you're free to `if let _ = add_rate_limit_headers(...`
-//!             // if you don't care about these errors.
-//!             match e {
-//!                 RateLimitError::HeaderError(e) => {
-//!                     eprintln!("Failed to set rate limit headers due to invalid value: {}", e);
-//!                 }
-//!                 RateLimitError::Other(e) => {
-//!                     eprintln!("Unexpected error setting rate limit headers: {}", e);
-//!                 }
-//!             }
-//!         }
-//!
-//!         Ok(response)    
-//!     } else {
-//!         // Handle other types of rejections, e.g.
-//!         Ok(warp::reply::with_status(
-//!             "Internal Server Error",
-//!             StatusCode::INTERNAL_SERVER_ERROR,
-//!         ).into_response())
-//!     }
-//! }
-//! ```
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use chrono::{DateTime, Duration as ChronoDuration, TimeDelta, Utc};
 use std::{collections::HashMap, net::IpAddr, str::FromStr as _};
+use std::{sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 use warp::{
     http::header::{self, HeaderMap, HeaderValue},
@@ -146,14 +35,14 @@ pub struct RateLimitInfo {
     /// Number of items in the internal map
     pub internal_map_len: usize,
     /// Least time the map was cleaned up
-    pub last_cleanup_time: Instant,
+    pub last_cleanup_time: DateTime<Utc>,
 }
 
 /// Custom rejection type for rate limiting
 #[derive(Debug)]
 pub struct RateLimitRejection {
     /// Duration until the client can retry
-    pub retry_after: Duration,
+    pub retry_after: TimeDelta,
     /// Maximum requests allowed in the window
     pub limit: u32,
     /// Unix timestamp when the rate limit resets
@@ -165,7 +54,7 @@ impl RateLimitRejection {
     pub fn formated_retry_after(&self) -> String {
         match self.retry_after_format {
             RetryAfterFormat::HttpDate => self.reset_time.to_rfc2822(),
-            RetryAfterFormat::Seconds => self.retry_after.as_secs().to_string(),
+            RetryAfterFormat::Seconds => self.retry_after.as_seconds_f64().to_string(),
         }
     }
 }
@@ -181,15 +70,15 @@ struct RateLimiter {
 // I really didn't want to have two different Arc<RwLock<T>> for data so interlinked
 #[derive(Clone)]
 struct RateLimiterMap {
-    inner: HashMap<String, (Instant, u32)>,
-    last_cleanup: Instant,
+    inner: HashMap<String, (DateTime<Utc>, DateTime<Utc>, u32)>,
+    last_cleanup: DateTime<Utc>,
 }
 
 impl RateLimiter {
     fn new(config: RateLimitConfig) -> Self {
         Self {
             state: Arc::new(RwLock::new(RateLimiterMap {
-                last_cleanup: Instant::now(),
+                last_cleanup: Utc::now(),
                 inner: HashMap::default(),
             })),
             config,
@@ -198,7 +87,7 @@ impl RateLimiter {
 
     async fn check_rate_limit(&self, key: &str) -> Result<RateLimitInfo, Rejection> {
         let mut map = self.state.write().await;
-        let now = Instant::now();
+        let now = Utc::now();
 
         // Cleanup the map to remove old entries
         if now - map.last_cleanup > self.config.window {
@@ -210,10 +99,10 @@ impl RateLimiter {
         let current = map.inner.get(key).copied();
 
         match current {
-            Some((last_request, count)) => {
-                if now.duration_since(last_request) > self.config.window {
+            Some((first_request, last_request, count)) => {
+                if now.signed_duration_since(last_request) > self.config.window {
                     // Window has passed, reset counter
-                    map.inner.insert(key.to_owned(), (now, 1));
+                    map.inner.insert(key.to_owned(), (now, now, 1));
                     Ok(self.create_info(
                         self.config.max_requests - 1,
                         now,
@@ -222,8 +111,8 @@ impl RateLimiter {
                     ))
                 } else if count >= self.config.max_requests {
                     // Rate limit exceeded
-                    let retry_after = self.config.window - now.duration_since(last_request);
-                    let reset_time = Utc::now() + ChronoDuration::from_std(retry_after).unwrap();
+                    let retry_after = self.config.window - now.signed_duration_since(first_request);
+                    let reset_time = Utc::now() + retry_after;
 
                     Err(reject::custom(RateLimitRejection {
                         retry_after,
@@ -233,10 +122,11 @@ impl RateLimiter {
                     }))
                 } else {
                     // Increment counter
-                    map.inner.insert(key.to_owned(), (last_request, count + 1));
+                    map.inner
+                        .insert(key.to_owned(), (first_request, last_request, count + 1));
                     Ok(self.create_info(
                         self.config.max_requests - (count + 1),
-                        last_request,
+                        first_request,
                         map.inner.len(),
                         map.last_cleanup,
                     ))
@@ -244,7 +134,7 @@ impl RateLimiter {
             }
             None => {
                 // First request
-                map.inner.insert(key.to_owned(), (now, 1));
+                map.inner.insert(key.to_owned(), (now, now, 1));
                 Ok(self.create_info(
                     self.config.max_requests - 1,
                     now,
@@ -258,25 +148,30 @@ impl RateLimiter {
     fn create_info(
         &self,
         remaining: u32,
-        start: Instant,
+        start: DateTime<Utc>,
         map_len: usize,
-        last_cleanup_time: Instant,
+        last_cleanup_time: DateTime<Utc>,
     ) -> RateLimitInfo {
         let reset_time = start + self.config.window;
         let retry_after = match self.config.retry_after_format {
             RetryAfterFormat::HttpDate => {
-                (Utc::now() + ChronoDuration::from_std(self.config.window).unwrap()).to_rfc2822()
+                // (Utc::now() + self.config.window).to_rfc2822()
+                reset_time.to_rfc2822()
             }
-            RetryAfterFormat::Seconds => self.config.window.as_secs().to_string(),
+            RetryAfterFormat::Seconds => {
+                // self.config.window.as_seconds_f64().to_string(),
+                (reset_time - Utc::now()).as_seconds_f64().to_string()
+            }
         };
 
         RateLimitInfo {
             retry_after,
             limit: self.config.max_requests,
             remaining,
-            reset_timestamp: (Utc::now()
-                + ChronoDuration::from_std(reset_time.duration_since(start)).unwrap())
-            .timestamp(),
+            // reset_timestamp: (Utc::now()
+            //     + ChronoDuration::from_std(reset_time.duration_since(start)).unwrap())
+            // .timestamp(),
+            reset_timestamp: reset_time.timestamp(),
             retry_after_format: self.config.retry_after_format.clone(),
             internal_map_len: map_len,
             last_cleanup_time,

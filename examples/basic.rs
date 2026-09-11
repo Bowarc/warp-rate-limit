@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use chrono::TimeDelta;
 use warp::{http::StatusCode, Filter, Rejection, Reply};
 use warp_rate_limit::*;
 
@@ -7,7 +8,7 @@ async fn main() {
     // Let's set up a rate limit configuration of 5 requests per 30 seconds:
     let rate_limit = RateLimitConfig {
         max_requests: 5,
-        window: std::time::Duration::from_secs(30),
+        window: TimeDelta::seconds(30),
         retry_after_format: RetryAfterFormat::HttpDate,
         ..Default::default()
     };

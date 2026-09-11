@@ -10,7 +10,8 @@ async fn main() {
         max_requests: 5,
         window: TimeDelta::seconds(30),
         retry_after_format: RetryAfterFormat::HttpDate,
-        ..Default::default()
+        ip_extraction_method: IpExtractionMethod::RemoteAddr,
+        // ..Default::default()
     };
 
     // We'll have a single route, /hello, that will be rate limited:

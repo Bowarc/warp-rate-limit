@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
-use chrono::{DateTime, Duration as ChronoDuration, TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
+use std::sync::Arc;
 use std::{collections::HashMap, net::IpAddr, str::FromStr as _};
-use std::{sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 use warp::{
+    filters::BoxedFilter,
     http::header::{self, HeaderMap, HeaderValue},
     reject, Filter, Rejection,
 };
@@ -12,7 +13,7 @@ use warp::{
 mod error;
 pub use error::RateLimitError;
 mod config;
-pub use config::{RateLimitConfig, RetryAfterFormat};
+pub use config::{RateLimitConfig, RetryAfterFormat, IpExtractionMethod};
 
 // Re-exports
 pub use chrono;
@@ -70,7 +71,7 @@ struct RateLimiter {
 // I really didn't want to have two different Arc<RwLock<T>> for data so interlinked
 #[derive(Clone)]
 struct RateLimiterMap {
-    inner: HashMap<String, (DateTime<Utc>, DateTime<Utc>, u32)>,
+    inner: HashMap<String, (DateTime<Utc>, u32)>,
     last_cleanup: DateTime<Utc>,
 }
 
@@ -92,17 +93,17 @@ impl RateLimiter {
         // Cleanup the map to remove old entries
         if now - map.last_cleanup > self.config.window {
             map.inner
-                .retain(|_ip, (last_request, ..)| now - *last_request < self.config.window);
+                .retain(|_ip, (first_request, ..)| now - *first_request < self.config.window);
             map.last_cleanup = now;
         }
 
         let current = map.inner.get(key).copied();
 
         match current {
-            Some((first_request, last_request, count)) => {
-                if now.signed_duration_since(last_request) > self.config.window {
+            Some((first_request, count)) => {
+                if now.signed_duration_since(first_request) > self.config.window {
                     // Window has passed, reset counter
-                    map.inner.insert(key.to_owned(), (now, now, 1));
+                    map.inner.insert(key.to_owned(), (now, 1));
                     Ok(self.create_info(
                         self.config.max_requests - 1,
                         now,
@@ -122,8 +123,7 @@ impl RateLimiter {
                     }))
                 } else {
                     // Increment counter
-                    map.inner
-                        .insert(key.to_owned(), (first_request, last_request, count + 1));
+                    map.inner.insert(key.to_owned(), (first_request, count + 1));
                     Ok(self.create_info(
                         self.config.max_requests - (count + 1),
                         first_request,
@@ -134,7 +134,7 @@ impl RateLimiter {
             }
             None => {
                 // First request
-                map.inner.insert(key.to_owned(), (now, now, 1));
+                map.inner.insert(key.to_owned(), (now, 1));
                 Ok(self.create_info(
                     self.config.max_requests - 1,
                     now,
@@ -183,33 +183,46 @@ impl RateLimiter {
 pub fn with_rate_limit(
     config: RateLimitConfig,
 ) -> impl Filter<Extract = (RateLimitInfo,), Error = Rejection> + Clone {
-    // Leaking the ip_header is fine as this function will only be executed at most once per route creation
-    let ip_header = config.ip_header.clone().leak();
+    fn ip_header_filter(ip_header: &'static str) -> BoxedFilter<(String,)> {
+        warp::filters::any::any()
+            .and(warp::filters::header::optional::<String>(ip_header).map(
+                |header_value: Option<String>| {
+                    // Try splitting it at ',' and parse the first element as this is the client ip on most reverse proxies
+                    // If that does not result in a valid IpAddr, abort and return 'unknown'
+                    header_value
+                        .and_then(|s| {
+                            s.split(",")
+                                .next()
+                                .map(str::trim)
+                                .map(IpAddr::from_str)
+                                .and_then(Result::ok)
+                                .as_ref()
+                                .map(ToString::to_string)
+                        })
+                        .unwrap_or("unknown".to_owned())
+                },
+            ))
+            .boxed()
+    }
 
+    fn remote_addr_filter() -> BoxedFilter<(String,)> {
+        warp::filters::addr::remote()
+            .map(move |addr: Option<std::net::SocketAddr>| {
+                addr.map(|a| a.ip().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            })
+            .boxed()
+    }
+
+    let ip_filter = match config.ip_extraction_method {
+        config::IpExtractionMethod::Header(ip_header) => ip_header_filter(ip_header),
+        config::IpExtractionMethod::RemoteAddr => remote_addr_filter(),
+    };
     let rate_limiter = RateLimiter::new(config);
 
-    // With a service implementation, it is possible to get the original remote() functionality
-    // https://github.com/seanmonstar/warp/issues/1127
-
-    warp::filters::any::any()
+    warp::any()
         .map(move || rate_limiter.clone())
-        .and(warp::filters::header::optional::<String>(ip_header).map(
-            |header_value: Option<String>| {
-                // Try splitting it at ',' and parse the first element as this is the client ip on most reverse proxies
-                // If that does not result in a valid IpAddr, abort and return 'unknown'
-                header_value
-                    .and_then(|s| {
-                        s.split(",")
-                            .next()
-                            .map(str::trim)
-                            .map(IpAddr::from_str)
-                            .and_then(Result::ok)
-                            .as_ref()
-                            .map(ToString::to_string)
-                    })
-                    .unwrap_or("unknown".to_owned())
-            },
-        ))
+        .and(ip_filter)
         .and_then(|rate_limiter: RateLimiter, ip: String| async move {
             rate_limiter.check_rate_limit(&ip).await
         })

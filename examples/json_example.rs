@@ -24,7 +24,8 @@ async fn main() {
     let rate_limit = RateLimitConfig {
         max_requests: 3,
         window: TimeDelta::seconds(30),
-        retry_after_format: RetryAfterFormat::Seconds,
+        retry_after_format: RetryAfterFormat::HttpDate,
+        ip_extraction_method: IpExtractionMethod::RemoteAddr,
         ..Default::default()
     };
 

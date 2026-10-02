@@ -1,19 +1,14 @@
 use chrono::{DateTime, Utc};
-use crate::config::RetryAfterFormat;
 
 /// Information about the current rate limit status
 #[derive(Clone, Debug)]
 pub struct RateLimitInfo {
-    /// Time until the rate limit resets
-    pub retry_after: String,
     /// Maximum requests allowed in the window
     pub limit: u32,
     /// Remaining requests in the current window
     pub remaining: u32,
     /// Unix timestamp when the rate limit resets
     pub reset_timestamp: i64,
-    /// Format used for retry-after header
-    pub retry_after_format: RetryAfterFormat,
 
     /// Number of items in the internal map
     pub internal_map_len: usize,

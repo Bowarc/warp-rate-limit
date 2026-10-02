@@ -2,7 +2,7 @@ use chrono::TimeDelta;
 use serde::Serialize;
 use serde_json::json;
 use std::convert::Infallible;
-use warp::{http::StatusCode, Filter, Rejection, Reply};
+use warp::{Filter, Rejection, Reply, http::StatusCode};
 use warp_rate_limit::*;
 
 // This example is similar to the basic.rs example, but differs in how it responds to
@@ -26,7 +26,8 @@ async fn main() {
         window: TimeDelta::seconds(30),
         retry_after_format: RetryAfterFormat::HttpDate,
         ip_extraction_method: IpExtractionMethod::RemoteAddr,
-        ..Default::default()
+        internal_map_max_length: None, // If this is set, you should handle `RateLimitCapacityRejection`
+                                       // as a potential rejection
     };
 
     // Create routes
@@ -68,8 +69,6 @@ async fn handle_request(rate_limit_info: RateLimitInfo) -> Result<impl Reply, Re
 // a json reply example using the information from our rate limit rejection:
 async fn handle_rejection(rejection: Rejection) -> Result<impl Reply, Infallible> {
     if let Some(rate_limit_rejection) = rejection.find::<RateLimitRejection>() {
-        // Grab the rate limit info:
-
         // Create a json response based on that info:
         let mut json_response = warp::reply::with_status(
             warp::reply::json(&MyCustomError {

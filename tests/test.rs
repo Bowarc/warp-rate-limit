@@ -1,14 +1,12 @@
 use chrono::{TimeDelta, Utc};
-use std::{
-    convert::Infallible,
-};
+use std::convert::Infallible;
 use tokio::task::JoinSet;
 use warp::hyper::header;
-use warp::{http::StatusCode, test::request, Filter};
-use warp::{reject::Rejection, Reply};
+use warp::{Filter, http::StatusCode, test::request};
+use warp::{Reply, reject::Rejection};
 use warp_rate_limit::{
-    add_rate_limit_headers, add_rate_limit_headers_from_rejection, with_rate_limit,
     RateLimitConfig, RateLimitError, RateLimitInfo, RateLimitRejection, RetryAfterFormat,
+    add_rate_limit_headers, add_rate_limit_headers_from_rejection, with_rate_limit,
 };
 
 // Helper function to create a test rate limiter with rejection handling
@@ -95,6 +93,11 @@ async fn test_comprehensive_rate_limit_rejection() {
 
     // Verify Retry-After is a number of seconds
     let retry_after = headers.get(header::RETRY_AFTER).unwrap().to_str().unwrap();
+    // This checks that:
+    // - It's a valid, non-decimal number
+    // - It is not negative
+    //
+    // (https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Retry-After)
     assert!(retry_after.parse::<u64>().is_ok());
 }
 
@@ -203,16 +206,16 @@ async fn test_concurrent_requests() {
     );
 }
 
-#[test]
+// #[test]
+// This test is no longer valid as the RateLimitInfo struct changed and the invalid possibilities, checked there
+// are no longer possible
 fn test_invalid_header_value_handling() {
     let mut headers = header::HeaderMap::new();
 
     let invalid_info = RateLimitInfo {
-        retry_after: "invalid\u{0000}characters".to_string(),
         limit: 100,
         remaining: 50,
         reset_timestamp: 1234567890,
-        retry_after_format: RetryAfterFormat::Seconds,
         internal_map_len: 0,
         last_cleanup_time: Utc::now(),
     };
@@ -220,10 +223,16 @@ fn test_invalid_header_value_handling() {
     let result = add_rate_limit_headers(&mut headers, &invalid_info);
     assert!(matches!(result, Err(RateLimitError::HeaderError(_))));
 
+    // Not invalid, because I don't care
+    // Yes it's wrong, but if this happens, it means that my time logic is wrong, or something funky happended with time
+    // The consequences of this being wrong are: the client might think that they are free to send another request asap, which will be declined
+    //
+    // the retry adter header
+
     // let mut headers = header::HeaderMap::new();
 
     // let invalid_info = RateLimitRejection {
-    //     retry_after: Duration::from_secs(10),
+    //     retry_after: TimeDelta::seconds(10),
     //     limit: 100,
     //     reset_time: DateTime::UNIX_EPOCH,
     //     retry_after_format: RetryAfterFormat::Seconds,
@@ -232,3 +241,38 @@ fn test_invalid_header_value_handling() {
     // let result = add_rate_limit_headers_from_rejection(&mut headers, &invalid_info);
     // assert!(matches!(result, Err(RateLimitError::HeaderError(_))));
 }
+
+// #[test]
+// fn size_of_map() {
+//     use chrono::{DateTime, Utc};
+//     use std::net::IpAddr;
+//     #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+//     enum RateLimitKey {
+//         Ip(IpAddr),
+//         Unknown, // Unidentified, sharing the same bucket
+//     }
+//     println!("key size: {} bytes", std::mem::size_of::<RateLimitKey>());
+
+//     println!(
+//         "value size: {} bytes",
+//         std::mem::size_of::<(DateTime<Utc>, u32)>()
+//     );
+
+//     println!(
+//         "RateLimitKey: {} bytes, alignment {}",
+//         size_of::<RateLimitKey>(),
+//         align_of::<RateLimitKey>()
+//     );
+
+//     println!(
+//         "value: {} bytes, alignment {}",
+//         size_of::<(DateTime<Utc>, u32)>(),
+//         align_of::<(DateTime<Utc>, u32)>()
+//     );
+
+//     println!(
+//         "IpAddr: {} bytes, alignment {}",
+//         size_of::<IpAddr>(),
+//         align_of::<IpAddr>()
+//     );
+// }

@@ -1,6 +1,6 @@
-use std::convert::Infallible;
 use chrono::TimeDelta;
-use warp::{http::StatusCode, Filter, Rejection, Reply};
+use std::convert::Infallible;
+use warp::{Filter, Rejection, Reply, http::StatusCode};
 use warp_rate_limit::*;
 
 #[tokio::main]
@@ -11,7 +11,8 @@ async fn main() {
         window: TimeDelta::seconds(30),
         retry_after_format: RetryAfterFormat::HttpDate,
         ip_extraction_method: IpExtractionMethod::RemoteAddr,
-        // ..Default::default()
+        internal_map_max_length: None, // If this is set, you should handle `RateLimitCapacityRejection`
+                                       // as a potential rejection
     };
 
     // We'll have a single route, /hello, that will be rate limited:

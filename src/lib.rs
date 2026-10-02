@@ -1,66 +1,28 @@
 #![forbid(unsafe_code)]
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::{collections::HashMap, net::IpAddr, str::FromStr as _};
 use tokio::sync::RwLock;
 use warp::{
+    Filter, Rejection,
     filters::BoxedFilter,
     http::header::{self, HeaderMap, HeaderValue},
-    reject, Filter, Rejection,
+    reject,
 };
 
+mod info;
+pub use info::RateLimitInfo;
+mod rejection;
+pub use rejection::RateLimitRejection;
 mod error;
 pub use error::RateLimitError;
 mod config;
-pub use config::{RateLimitConfig, RetryAfterFormat, IpExtractionMethod};
+pub use config::{IpExtractionMethod, RateLimitConfig, RetryAfterFormat};
 
 // Re-exports
 pub use chrono;
 pub use serde;
-
-/// Information about the current rate limit status
-#[derive(Clone, Debug)]
-pub struct RateLimitInfo {
-    /// Time until the rate limit resets
-    pub retry_after: String,
-    /// Maximum requests allowed in the window
-    pub limit: u32,
-    /// Remaining requests in the current window
-    pub remaining: u32,
-    /// Unix timestamp when the rate limit resets
-    pub reset_timestamp: i64,
-    /// Format used for retry-after header
-    pub retry_after_format: RetryAfterFormat,
-
-    /// Number of items in the internal map
-    pub internal_map_len: usize,
-    /// Least time the map was cleaned up
-    pub last_cleanup_time: DateTime<Utc>,
-}
-
-/// Custom rejection type for rate limiting
-#[derive(Debug)]
-pub struct RateLimitRejection {
-    /// Duration until the client can retry
-    pub retry_after: TimeDelta,
-    /// Maximum requests allowed in the window
-    pub limit: u32,
-    /// Unix timestamp when the rate limit resets
-    pub reset_time: DateTime<Utc>,
-    /// Format to use for Retry-After header
-    pub retry_after_format: RetryAfterFormat,
-}
-impl RateLimitRejection {
-    pub fn formated_retry_after(&self) -> String {
-        match self.retry_after_format {
-            RetryAfterFormat::HttpDate => self.reset_time.to_rfc2822(),
-            RetryAfterFormat::Seconds => self.retry_after.as_seconds_f64().to_string(),
-        }
-    }
-}
-
-impl warp::reject::Reject for RateLimitRejection {}
 
 #[derive(Clone)]
 struct RateLimiter {
@@ -71,7 +33,10 @@ struct RateLimiter {
 // I really didn't want to have two different Arc<RwLock<T>> for data so interlinked
 #[derive(Clone)]
 struct RateLimiterMap {
+    // key: IP of the user
+    // value: (time of the first request of the window (window start), number of requests in the window)
     inner: HashMap<String, (DateTime<Utc>, u32)>,
+    // Last time the map was cleaned up
     last_cleanup: DateTime<Utc>,
 }
 
@@ -90,7 +55,7 @@ impl RateLimiter {
         let mut map = self.state.write().await;
         let now = Utc::now();
 
-        // Cleanup the map to remove old entries
+        // Cleanup: Remove all entries where the window has expired (window start earlier than now - config.window)
         if now - map.last_cleanup > self.config.window {
             map.inner
                 .retain(|_ip, (first_request, ..)| now - *first_request < self.config.window);
@@ -99,50 +64,85 @@ impl RateLimiter {
 
         let current = map.inner.get(key).copied();
 
-        match current {
-            Some((first_request, count)) => {
-                if now.signed_duration_since(first_request) > self.config.window {
-                    // Window has passed, reset counter
-                    map.inner.insert(key.to_owned(), (now, 1));
-                    Ok(self.create_info(
-                        self.config.max_requests - 1,
-                        now,
-                        map.inner.len(),
-                        map.last_cleanup,
-                    ))
-                } else if count >= self.config.max_requests {
-                    // Rate limit exceeded
-                    let retry_after = self.config.window - now.signed_duration_since(first_request);
-                    let reset_time = Utc::now() + retry_after;
+        // match current {
+        //     // There is no entry for that ip or the entry has expired
+        //     // Reset
+        //     current
+        //         if current.is_none_or(|(window_start, _)| {
+        //             now.signed_duration_since(window_start) >= self.config.window
+        //         }) =>
+        //     {
+        //         map.inner.insert(key.to_owned(), (now, 1));
+        //         Ok(self.create_info(
+        //             self.config.max_requests - 1,
+        //             now,
+        //             map.inner.len(),
+        //             map.last_cleanup,
+        //         ))
+        //     }
+        //     // The entry request count has exceeded the maxium
+        //     // Restrict
+        //     Some((first_request, count)) if count > self.config.max_requests => {
+        //         let retry_after = self.config.window - now.signed_duration_since(first_request);
+        //         let reset_time = Utc::now() + retry_after;
 
-                    Err(reject::custom(RateLimitRejection {
+        //         Err(reject::custom(RateLimitRejection {
+        //             retry_after,
+        //             limit: self.config.max_requests,
+        //             reset_time,
+        //             retry_after_format: self.config.retry_after_format.clone(),
+        //         }))
+        //     }
+        //     // The entry exists, has not expired or exceeded the request limit
+        //     // Increment
+        //     Some((window_start, count)) => {
+        //         map.inner.insert(key.to_owned(), (window_start, count + 1));
+        //         Ok(self.create_info(
+        //             self.config.max_requests - (count + 1),
+        //             window_start,
+        //             map.inner.len(),
+        //             map.last_cleanup,
+        //         ))
+        //     }
+        //     None => unreachable!(), // Taken care of by the first pattern
+        // }
+
+        let (new_window_start, new_count) = match current {
+            // Entry exist and has not expired
+            // Check count, reject if too high, increment if not
+            Some((window_start, count))
+                if now.signed_duration_since(window_start) < self.config.window =>
+            {
+                if count > self.config.max_requests {
+                    // The request limit has been reached, reject the request
+                    let retry_after = self.config.window - now.signed_duration_since(window_start);
+
+                    return Err(reject::custom(RateLimitRejection {
                         retry_after,
                         limit: self.config.max_requests,
-                        reset_time,
+                        reset_time: now + retry_after,
                         retry_after_format: self.config.retry_after_format.clone(),
-                    }))
+                    }));
                 } else {
-                    // Increment counter
-                    map.inner.insert(key.to_owned(), (first_request, count + 1));
-                    Ok(self.create_info(
-                        self.config.max_requests - (count + 1),
-                        first_request,
-                        map.inner.len(),
-                        map.last_cleanup,
-                    ))
+                    // The limit has NOT been reached yet, increment the count and continue
+                    (window_start, count + 1)
                 }
             }
-            None => {
-                // First request
-                map.inner.insert(key.to_owned(), (now, 1));
-                Ok(self.create_info(
-                    self.config.max_requests - 1,
-                    now,
-                    map.inner.len(),
-                    map.last_cleanup,
-                ))
-            }
-        }
+            // The entry does not exist OR the window has expired
+            // Reset
+            _ => (now, 1),
+        };
+
+        // This updates the entry if it exists, insert otherwise
+        map.inner
+            .insert(key.to_owned(), (new_window_start, new_count));
+
+        Ok(self.create_info(
+            self.config.max_requests - new_count,
+            new_window_start,
+            map.inner.len(),
+            map.last_cleanup,
+        ))
     }
 
     fn create_info(
@@ -168,9 +168,6 @@ impl RateLimiter {
             retry_after,
             limit: self.config.max_requests,
             remaining,
-            // reset_timestamp: (Utc::now()
-            //     + ChronoDuration::from_std(reset_time.duration_since(start)).unwrap())
-            // .timestamp(),
             reset_timestamp: reset_time.timestamp(),
             retry_after_format: self.config.retry_after_format.clone(),
             internal_map_len: map_len,

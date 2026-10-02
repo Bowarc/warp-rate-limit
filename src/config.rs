@@ -28,33 +28,25 @@ pub struct RateLimitConfig {
     /// Format for Retry-After header (RFC 7231 Date or Seconds)
     pub retry_after_format: RetryAfterFormat,
 
-    /// Header used to extract the client's ip address
-    // pub ip_header: String,
 
-    // The method for extracting the client's ip
-    // For untrusted environements or where the server is directly reachable from the internet
-    // RemoteAddr is the safer solution, but if the warp server is behind a reverse proxy, this might not work
-    // (i.e return the address of the proxy instead of the client's)
-    // In this case, use 
-    // Header("X-Forwarded-For")
-    // And make sure your reverse proxy correctly sets the header
+    /// The method used for extracting the client's ip
+    /// For untrusted environements or where the server is directly reachable from the internet
+    /// RemoteAddr is the safer solution, but if the warp server is behind a reverse proxy, this might not work
+    /// (i.e return the address of the proxy instead of the client's)
+    /// In this case, use 
+    /// Header("X-Forwarded-For")
+    /// And make sure your reverse proxy correctly sets the header
     pub ip_extraction_method: IpExtractionMethod,
 }
 /// Sensible (opinionated) defaults
 impl Default for RateLimitConfig {
+    /// 60 req/min baseline
     fn default() -> Self {
         Self {
-            max_requests: 60, // 60 req/min baseline
-            // window: Duration::from_secs(60),
+            max_requests: 60,
             window: TimeDelta::seconds(60),
             retry_after_format: RetryAfterFormat::HttpDate,
-
-            // ip_header: String::from("X-Forwarded-For"), // It's the one used by most of the revese proxies
-            ip_extraction_method: IpExtractionMethod::Header({
-                let b = Box::new(String::from("Test"));
-
-                b.leak()
-            })
+            ip_extraction_method: IpExtractionMethod::RemoteAddr,
         }
     }
 }
